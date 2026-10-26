@@ -34,6 +34,9 @@ type OverpassElement = {
   tags?: Record<string, string>;
 };
 
+// Default location: Denville, New Jersey
+const DENVILLE: Coordinates = [40.8923, -74.4774];
+
 const facilityIcon = L.icon({
   iconUrl: hospitalImage,
   iconSize: [42, 42],
@@ -51,23 +54,19 @@ function MapUpdater({
   position,
   selectedFacility,
 }: {
-  position: Coordinates | null;
+  position: Coordinates;
   selectedFacility: Coordinates | null;
 }) {
   const map = useMap();
 
   useEffect(() => {
     const target = selectedFacility ?? position;
-    if (target) {
-      map.flyTo(target, selectedFacility ? 15 : 12, {
-        duration: 1,
-      });
-    }
+    map.flyTo(target, selectedFacility ? 15 : 12, {
+      duration: 1,
+    });
   }, [
-    position?.[0],
-    position?.[1],
-    selectedFacility?.[0],
-    selectedFacility?.[1],
+    position,
+    selectedFacility,
     map,
   ]);
 
@@ -80,16 +79,23 @@ function distanceKm(
   lat2: number,
   lon2: number,
 ) {
-  const radians = (degrees: number) => (degrees * Math.PI) / 180;
+  const radians = (degrees: number) =>
+    (degrees * Math.PI) / 180;
+
   const dLat = radians(lat2 - lat1);
   const dLon = radians(lon2 - lon1);
+
   const a =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(radians(lat1)) *
       Math.cos(radians(lat2)) *
       Math.sin(dLon / 2) ** 2;
 
-  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return (
+    6371 *
+    2 *
+    Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+  );
 }
 
 function classifyFacility(
@@ -98,6 +104,7 @@ function classifyFacility(
   const amenity = (tags.amenity ?? "").toLowerCase();
   const healthcare = (tags.healthcare ?? "").toLowerCase();
   const name = (tags.name ?? "").toLowerCase();
+
   const speciality = (
     tags["healthcare:speciality"] ?? ""
   )
@@ -132,7 +139,10 @@ function classifyFacility(
     return "primary";
   }
 
-  if (amenity === "hospital" || healthcare === "hospital") {
+  if (
+    amenity === "hospital" ||
+    healthcare === "hospital"
+  ) {
     return "emergency";
   }
 
@@ -187,20 +197,137 @@ function createFacility(
 
 export default function App() {
   const [position, setPosition] =
-    useState<Coordinates | null>(null);
-  const [facilities, setFacilities] = useState<Facility[]>([]);
+    useState<Coordinates>(DENVILLE);
+
+  const [facilities, setFacilities] =
+    useState<Facility[]>([]);
+
   const [selectedType, setSelectedType] =
     useState<CareType | "all">("all");
+
   const [selectedFacility, setSelectedFacility] =
     useState<Facility | null>(null);
+
   const [status, setStatus] = useState(
-    "Select the button below to find nearby healthcare facilities.",
+    "Loading healthcare facilities near Denville, NJ...",
   );
+
   const [loading, setLoading] = useState(false);
 
+  // Search for hospitals and other healthcare facilities
+  // around the supplied coordinates.
+  const searchFacilities = useCallback(
+    async (location: Coordinates) => {
+      const [lat, lon] = location;
+
+      setPosition(location);
+      setFacilities([]);
+      setSelectedFacility(null);
+      setLoading(true);
+      setStatus("Searching for nearby healthcare facilities...");
+
+      const query = `
+        [out:json][timeout:25];
+        (
+          nwr["amenity"~"^(hospital|urgent_care|doctors|clinic)$"]
+            (around:15000,${lat},${lon});
+          nwr["healthcare"~"^(hospital|urgent_care|doctor|doctors|clinic|centre|center)$"]
+            (around:15000,${lat},${lon});
+          nwr["healthcare:speciality"~"urgent",i]
+            (around:15000,${lat},${lon});
+        );
+        out center tags;
+      `;
+
+      try {
+        const response = await fetch(
+          "https://overpass-api.de/api/interpreter",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            body: new URLSearchParams({
+              data: query,
+            }).toString(),
+          },
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            "The map service is busy. Please try again shortly.",
+          );
+        }
+
+        const data: {
+          elements?: OverpassElement[];
+        } = await response.json();
+
+        const results = (data.elements ?? [])
+          .map(createFacility)
+          .filter(
+            (facility): facility is Facility =>
+              facility !== null,
+          );
+
+        // Remove duplicate records.
+        const unique = new Map<string, Facility>();
+
+        for (const facility of results) {
+          const name = facility.name.trim().toLowerCase();
+
+          const locationKey =
+            `${facility.lat.toFixed(4)},${facility.lon.toFixed(4)}`;
+
+          const key =
+            name === "unnamed healthcare facility"
+              ? locationKey
+              : `${name}|${locationKey}`;
+
+          if (!unique.has(key)) {
+            unique.set(key, facility);
+          }
+        }
+
+        // Sort facilities from nearest to farthest.
+        const sorted = Array.from(unique.values()).sort(
+          (a, b) =>
+            distanceKm(lat, lon, a.lat, a.lon) -
+            distanceKm(lat, lon, b.lat, b.lon),
+        );
+
+        setFacilities(sorted);
+
+        setStatus(
+          sorted.length
+            ? `Found ${sorted.length} mapped facilities within 15 km.`
+            : "No matching facilities were found within 15 km. Try again later.",
+        );
+      } catch (error) {
+        setStatus(
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while searching.",
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  // Automatically search Denville when the app opens.
+  useEffect(() => {
+    void searchFacilities(DENVILLE);
+  }, [searchFacilities]);
+
+  // Let users search around their actual device location.
   const findMyLocation = useCallback(() => {
     if (!navigator.geolocation) {
-      setStatus("Your browser does not support location services.");
+      setStatus(
+        "Your browser does not support location services.",
+      );
       return;
     }
 
@@ -208,99 +335,18 @@ export default function App() {
     setStatus("Requesting your location...");
 
     navigator.geolocation.getCurrentPosition(
-      async (location) => {
-        const lat = location.coords.latitude;
-        const lon = location.coords.longitude;
-
-        setPosition([lat, lon]);
-        setFacilities([]);
-        setSelectedFacility(null);
-        setStatus("Searching for nearby healthcare facilities...");
-
-        const query = `
-          [out:json][timeout:25];
-          (
-            nwr["amenity"~"^(hospital|urgent_care|doctors|clinic)$"]
-              (around:15000,${lat},${lon});
-            nwr["healthcare"~"^(hospital|urgent_care|doctor|doctors|clinic)$"]
-              (around:15000,${lat},${lon});
-            nwr["healthcare:speciality"~"urgent",i]
-              (around:15000,${lat},${lon});
-          );
-          out center tags;
-        `;
-
-        try {
-          const response = await fetch(
-            "https://overpass-api.de/api/interpreter",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type":
-                  "application/x-www-form-urlencoded;charset=UTF-8",
-              },
-              body: new URLSearchParams({ data: query }).toString(),
-            },
-          );
-
-          if (!response.ok) {
-            throw new Error(
-              "The map data service is busy. Please try again shortly.",
-            );
-          }
-
-          const data: { elements?: OverpassElement[] } =
-            await response.json();
-
-          const results = (data.elements ?? [])
-            .map(createFacility)
-            .filter(
-              (facility): facility is Facility => facility !== null,
-            );
-
-          // Remove duplicate records for the same named place and location.
-          const unique = new Map<string, Facility>();
-
-          for (const facility of results) {
-            const name = facility.name.trim().toLowerCase();
-            const locationKey =
-              `${facility.lat.toFixed(4)},${facility.lon.toFixed(4)}`;
-            const key =
-              name === "unnamed healthcare facility"
-                ? locationKey
-                : `${name}|${locationKey}`;
-
-            if (!unique.has(key)) unique.set(key, facility);
-          }
-
-          const sorted = Array.from(unique.values()).sort(
-            (a, b) =>
-              distanceKm(lat, lon, a.lat, a.lon) -
-              distanceKm(lat, lon, b.lat, b.lon),
-          );
-
-          setFacilities(sorted);
-          setStatus(
-            sorted.length
-              ? `Found ${sorted.length} mapped facilities within 15 km.`
-              : "No matching facilities were found within 15 km. Try again later.",
-          );
-        } catch (error) {
-          setStatus(
-            error instanceof Error
-              ? error.message
-              : "Something went wrong while searching.",
-          );
-        } finally {
-          setLoading(false);
-        }
+      (location) => {
+        void searchFacilities([
+          location.coords.latitude,
+          location.coords.longitude,
+        ]);
       },
       (error) => {
         setLoading(false);
 
         if (error.code === error.PERMISSION_DENIED) {
           setStatus(
-            "Location permission was denied. Allow location access in your browser settings and try again.",
+            "Location permission was denied. You can still use the Denville map.",
           );
         } else if (error.code === error.TIMEOUT) {
           setStatus(
@@ -308,17 +354,17 @@ export default function App() {
           );
         } else {
           setStatus(
-            "Unable to find your location. Check your browser settings and try again.",
+            "Unable to find your location. You can still use the Denville map.",
           );
         }
       },
       {
-        enableHighAccuracy: true,
+        enableHighAccuracy: false,
         timeout: 15000,
         maximumAge: 60000,
       },
     );
-  }, []);
+  }, [searchFacilities]);
 
   const filteredFacilities =
     selectedType === "all"
@@ -336,15 +382,15 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-  <div className="brand-text">
-    <h1>Med-Finder</h1>
-    <p>Find nearby healthcare, when it matters.</p>
-  </div>
-</header>
+        <div className="brand-text">
+          <h1>Med-Finder</h1>
+          <p>Find nearby healthcare, when it matters.</p>
+        </div>
+      </header>
 
       <div className="emergency-banner" role="note">
-        <strong>Medical emergency?</strong> If someone is in immediate,
-        life-threatening danger in the US, call 911.
+        <strong>Medical emergency?</strong> If someone is in
+        immediate, life-threatening danger in the US, call 911.
       </div>
 
       <main className="content">
@@ -354,6 +400,7 @@ export default function App() {
               <span className="eyebrow">YOUR AREA</span>
               <h2>Healthcare map</h2>
             </div>
+
             <span className="result-count">
               {filteredFacilities.length} results
             </span>
@@ -364,7 +411,17 @@ export default function App() {
             onClick={findMyLocation}
             disabled={loading}
           >
-            {loading ? "Searching..." : "Find facilities near me"}
+            {loading
+              ? "Searching..."
+              : "Find facilities near me"}
+          </button>
+
+          <button
+            className="text-button"
+            onClick={() => void searchFacilities(DENVILLE)}
+            disabled={loading}
+          >
+            Back to Denville, NJ
           </button>
 
           <p className="status" role="status">
@@ -372,7 +429,10 @@ export default function App() {
           </p>
 
           <div className="filter-section">
-            <label htmlFor="care-filter">Filter by type of care</label>
+            <label htmlFor="care-filter">
+              Filter by type of care
+            </label>
+
             <select
               id="care-filter"
               value={selectedType}
@@ -391,8 +451,8 @@ export default function App() {
           </div>
 
           <MapContainer
-            center={[39.8283, -98.5795]}
-            zoom={4}
+            center={DENVILLE}
+            zoom={13}
             className="map"
             scrollWheelZoom
           >
@@ -405,16 +465,13 @@ export default function App() {
               position={position}
               selectedFacility={
                 selectedFacility
-                  ? [selectedFacility.lat, selectedFacility.lon]
+                  ? [
+                      selectedFacility.lat,
+                      selectedFacility.lon,
+                    ]
                   : null
               }
             />
-
-            {position && (
-              <Marker position={position}>
-                <Popup>Your approximate device location</Popup>
-              </Marker>
-            )}
 
             {filteredFacilities.map((facility) => (
               <Marker
@@ -457,9 +514,11 @@ export default function App() {
             </div>
           </div>
 
-          {nearest && position && (
+          {nearest && (
             <div className="data-card nearest-card">
-              <span className="eyebrow">CLOSEST LISTED OPTION</span>
+              <span className="eyebrow">
+                CLOSEST LISTED OPTION
+              </span>
               <h3>{nearest.name}</h3>
               <p>{careLabels[nearest.careType]}</p>
               <p className="distance">
@@ -485,9 +544,11 @@ export default function App() {
               <span className="empty-icon"></span>
               <h3>No facilities to show yet</h3>
               <p>
-                {facilities.length === 0
-                  ? "Find facilities near you to load available map listings."
-                  : "No facilities match this filter. Try another type of care."}
+                {loading
+                  ? "Loading nearby facilities..."
+                  : facilities.length === 0
+                    ? "No facilities were loaded. Try searching again."
+                    : "No facilities match this filter. Try another type of care."}
               </p>
             </div>
           ) : (
@@ -517,6 +578,7 @@ export default function App() {
                     <div className="mini-cross" aria-hidden="true">
                       +
                     </div>
+
                     <div className="facility-card-title">
                       <h3>{facility.name}</h3>
                       <span className="care-label">
@@ -531,17 +593,15 @@ export default function App() {
                     </p>
                   )}
 
-                  {position && (
-                    <p className="distance">
-                      {distanceKm(
-                        position[0],
-                        position[1],
-                        facility.lat,
-                        facility.lon,
-                      ).toFixed(1)}{" "}
-                      km away in a straight line
-                    </p>
-                  )}
+                  <p className="distance">
+                    {distanceKm(
+                      position[0],
+                      position[1],
+                      facility.lat,
+                      facility.lon,
+                    ).toFixed(1)}{" "}
+                    km away in a straight line
+                  </p>
 
                   <span className="card-action-hint">
                     Select for details and directions →
@@ -576,7 +636,10 @@ export default function App() {
             <span className="eyebrow">
               {careLabels[selectedFacility.careType]}
             </span>
-            <h2 id="drawer-title">{selectedFacility.name}</h2>
+
+            <h2 id="drawer-title">
+              {selectedFacility.name}
+            </h2>
 
             <div className="drawer-info">
               <strong>Address</strong>
@@ -599,38 +662,39 @@ export default function App() {
               </p>
             </div>
 
-            {position && (
-              <div className="drawer-info">
-                <strong>Distance</strong>
-                <p>
-                  {distanceKm(
-                    position[0],
-                    position[1],
-                    selectedFacility.lat,
-                    selectedFacility.lon,
-                  ).toFixed(1)}{" "}
-                  km in a straight line; actual travel distance may differ.
-                </p>
-              </div>
-            )}
+            <div className="drawer-info">
+              <strong>Distance</strong>
+              <p>
+                {distanceKm(
+                  position[0],
+                  position[1],
+                  selectedFacility.lat,
+                  selectedFacility.lon,
+                ).toFixed(1)}{" "}
+                km in a straight line; actual travel distance may differ.
+              </p>
+            </div>
 
-           <a
-  className="drawer-primary-button"
-  href={`https://www.google.com/maps/dir/?api=1&origin=${position ? `${position[0]},${position[1]}` : ""}&destination=${selectedFacility.lat},${selectedFacility.lon}&travelmode=driving`}
-  target="_blank"
-  rel="noopener noreferrer"
->
-  Get directions ↗
-</a>
+            <a
+              className="drawer-primary-button"
+              href={`https://www.google.com/maps/dir/?api=1&origin=${position[0]},${position[1]}&destination=${selectedFacility.lat},${selectedFacility.lon}&travelmode=driving`}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Get directions ↗
+            </a>
+
             <div className="transport-section">
               <div className="transport-icon" aria-hidden="true">
                 ↗
               </div>
+
               <h3>Need help getting there?</h3>
               <p>
                 Explore community resources that may help you find
                 transportation. Availability and eligibility vary.
               </p>
+
               <a
                 className="drawer-secondary-button"
                 href="https://www.211.org/"
@@ -643,10 +707,10 @@ export default function App() {
 
             <p className="drawer-disclaimer">
               Information comes from public map data and may be
-              incomplete or outdated. Confirm the facility's services,
-              hours, and transportation availability before relying on
-              them. Med-Finder does not book rides or verify emergency
-              department availability.
+              incomplete or outdated. Confirm facility services,
+              hours, and transportation availability before relying
+              on them. Med-Finder does not book rides or verify
+              emergency department availability.
             </p>
           </aside>
         </div>
